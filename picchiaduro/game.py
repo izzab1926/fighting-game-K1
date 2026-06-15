@@ -1,17 +1,24 @@
-"""Loop principale, stati di gioco e HUD del picchiaduro."""
+"""Loop principale, stati di gioco, ring 2.5D e HUD del kickboxing."""
 
 import sys
 
 import pygame
 
 from . import settings as S
+from . import prospettiva as P
 from .fighter import Lottatore
+from .ia import IAKickboxer
 
 # Stati di gioco
 MENU = "menu"
 COMBATTIMENTO = "combattimento"
 FINE_ROUND = "fine_round"
 FINE_PARTITA = "fine_partita"
+
+# Posizioni di partenza nel mondo
+START_X1 = S.RING_LARGHEZZA * 0.30
+START_X2 = S.RING_LARGHEZZA * 0.70
+START_Z = S.RING_PROFONDITA * 0.5
 
 
 class Gioco:
@@ -21,11 +28,13 @@ class Gioco:
         pygame.display.set_caption(S.TITOLO)
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("consolas", 28)
-        self.font_grande = pygame.font.SysFont("consolas", 72, bold=True)
+        self.font_grande = pygame.font.SysFont("consolas", 64, bold=True)
         self.font_piccolo = pygame.font.SysFont("consolas", 20)
 
         self.stato = MENU
         self.in_esecuzione = True
+        self.vs_cpu = True               # modalita' selezionata nel menu
+        self.ia = None
         self.crea_lottatori()
         self.timer_pausa = 0.0
         self.tempo_round = float(S.DURATA_ROUND)
@@ -33,21 +42,21 @@ class Gioco:
 
     # ------------------------------------------------------------- setup
     def crea_lottatori(self):
-        margine = 150
-        self.p1 = Lottatore(margine, "Giocatore 1", S.BLU,
+        self.p1 = Lottatore(START_X1, START_Z, "Giocatore 1", S.BLU,
                             S.CONTROLLI_P1, guarda_destra=True)
-        self.p2 = Lottatore(S.LARGHEZZA - margine - S.LARGHEZZA_LOTTATORE,
-                            "Giocatore 2", S.ROSSO,
+        nome2 = "CPU" if self.vs_cpu else "Giocatore 2"
+        self.p2 = Lottatore(START_X2, START_Z, nome2, S.ROSSO,
                             S.CONTROLLI_P2, guarda_destra=False)
 
     def nuovo_round(self):
-        margine = 150
-        self.p1.reset_round(margine, True)
-        self.p2.reset_round(S.LARGHEZZA - margine - S.LARGHEZZA_LOTTATORE, False)
+        self.p1.reset_round(START_X1, START_Z, True)
+        self.p2.reset_round(START_X2, START_Z, False)
         self.tempo_round = float(S.DURATA_ROUND)
         self.stato = COMBATTIMENTO
 
     def nuova_partita(self):
+        self.p2.nome = "CPU" if self.vs_cpu else "Giocatore 2"
+        self.ia = IAKickboxer(difficolta="media") if self.vs_cpu else None
         self.p1.round_vinti = 0
         self.p2.round_vinti = 0
         self.nuovo_round()
@@ -59,36 +68,40 @@ class Gioco:
                 self.in_esecuzione = False
             elif ev.type == pygame.KEYDOWN:
                 if ev.key == pygame.K_ESCAPE:
-                    self.in_esecuzione = False
-                elif ev.key == pygame.K_RETURN:
                     if self.stato == MENU:
-                        self.nuova_partita()
-                    elif self.stato == FINE_PARTITA:
+                        self.in_esecuzione = False
+                    else:
                         self.stato = MENU
+                elif self.stato == MENU:
+                    if ev.key in (pygame.K_UP, pygame.K_DOWN,
+                                  pygame.K_LEFT, pygame.K_RIGHT):
+                        self.vs_cpu = not self.vs_cpu
+                    elif ev.key == pygame.K_RETURN:
+                        self.nuova_partita()
+                elif self.stato == FINE_PARTITA and ev.key == pygame.K_RETURN:
+                    self.stato = MENU
 
     # ------------------------------------------------------------ logica
     def risolvi_colpi(self, attaccante, difensore):
-        if attaccante.attacco is None or attaccante.colpo_a_segno:
+        if attaccante.colpo_a_segno:
             return
-        hb = attaccante.hitbox_attacco()
-        if hb is None:
-            return
-        if hb.colliderect(difensore.rect):
+        if attaccante.colpisce(difensore):
             dati = S.ATTACCHI[attaccante.attacco]
             direzione = 1 if attaccante.guarda_destra else -1
-            difensore.subisci_colpo(dati["danno"], dati["knockback"], direzione)
+            difensore.subisci_colpo(dati, direzione)
             attaccante.colpo_a_segno = True
 
     def aggiorna(self, dt):
         if self.stato == COMBATTIMENTO:
             tasti = pygame.key.get_pressed()
             self.p1.gestisci_input(tasti)
-            self.p2.gestisci_input(tasti)
+            if self.vs_cpu:
+                self.ia.agisci(self.p2, self.p1)
+            else:
+                self.p2.gestisci_input(tasti)
 
             self.p1.aggiorna(self.p2)
             self.p2.aggiorna(self.p1)
-
-            # impedisci la sovrapposizione dei corpi
             self.separa(self.p1, self.p2)
 
             self.risolvi_colpi(self.p1, self.p2)
@@ -107,18 +120,19 @@ class Gioco:
                     self.nuovo_round()
 
     def separa(self, a, b):
-        ra, rb = a.rect, b.rect
-        if ra.colliderect(rb):
-            sovrapp = min(ra.right, rb.right) - max(ra.left, rb.left)
-            meta = sovrapp / 2 + 1
-            if a.centro_x < b.centro_x:
-                a.x -= meta
-                b.x += meta
-            else:
-                a.x += meta
-                b.x -= meta
-            a.x = max(0, min(S.LARGHEZZA - a.larghezza, a.x))
-            b.x = max(0, min(S.LARGHEZZA - b.larghezza, b.x))
+        """Evita la compenetrazione solo se vicini anche in profondita'."""
+        if abs(a.z - b.z) > S.LARGHEZZA_LOTTATORE * 0.6:
+            return
+        dist = a.x - b.x
+        minimo = a.meta_larghezza + b.meta_larghezza
+        if abs(dist) < minimo:
+            spinta = (minimo - abs(dist)) / 2 + 0.5
+            segno = 1 if dist >= 0 else -1
+            a.x += spinta * segno
+            b.x -= spinta * segno
+            for f in (a, b):
+                f.x = max(f.meta_larghezza,
+                          min(S.RING_LARGHEZZA - f.meta_larghezza, f.x))
 
     def controlla_fine_round(self):
         fine = False
@@ -131,7 +145,6 @@ class Gioco:
             self.messaggio = f"{self.p1.nome} vince il round!"
             fine = True
         elif (self.p1.ko and self.p2.ko) or self.tempo_round <= 0:
-            # tempo scaduto o doppio KO: vince chi ha più vita
             if self.p1.vita > self.p2.vita:
                 self.p1.round_vinti += 1
                 self.messaggio = f"{self.p1.nome} vince ai punti!"
@@ -147,72 +160,90 @@ class Gioco:
             self.stato = FINE_ROUND
 
     # ------------------------------------------------------------- disegno
-    def disegna_scena(self):
+    def disegna_ring(self):
         self.schermo.fill(S.CIELO)
-        # pavimento
-        pygame.draw.rect(self.schermo, S.GRIGIO_SCURO,
-                        (0, S.SUOLO, S.LARGHEZZA, S.ALTEZZA - S.SUOLO))
-        pygame.draw.line(self.schermo, S.GRIGIO,
-                        (0, S.SUOLO), (S.LARGHEZZA, S.SUOLO), 3)
-        self.p1.disegna(self.schermo)
-        self.p2.disegna(self.schermo)
+        bl, br, tr, tl = P.angoli_ring()
+        # pavimento (trapezio prospettico)
+        pygame.draw.polygon(self.schermo, S.RING, [bl, br, tr, tl])
+        # corde/linee di profondita'
+        for i in range(1, 4):
+            z = S.RING_PROFONDITA * i / 4
+            a = P.proietta(0, z)
+            b = P.proietta(S.RING_LARGHEZZA, z)
+            pygame.draw.line(self.schermo, S.GRIGIO_SCURO, a, b, 2)
+        # bordo del ring
+        pygame.draw.polygon(self.schermo, S.RING_BORDO, [bl, br, tr, tl], 4)
+
+    def disegna_scena(self):
+        self.disegna_ring()
+        # disegna prima chi e' piu' in fondo (z maggiore)
+        for f in sorted([self.p1, self.p2], key=lambda f: -f.z):
+            f.disegna(self.schermo)
         self.disegna_hud()
 
-    def disegna_barra_vita(self, lottatore, x, allinea_destra):
-        larghezza = 380
-        altezza = 26
-        y = 24
-        if allinea_destra:
-            x = x - larghezza
-        cornice = pygame.Rect(x, y, larghezza, altezza)
+    def disegna_barra(self, x, y, larg, alt, frazione, colore, allinea_destra):
+        cornice = pygame.Rect(x - larg if allinea_destra else x, y, larg, alt)
         pygame.draw.rect(self.schermo, S.GRIGIO_SCURO, cornice)
-
-        frazione = lottatore.vita / S.VITA_MAX
-        riempita = int(larghezza * frazione)
-        colore = S.VERDE if frazione > 0.3 else S.ROSSO
+        riempita = int(larg * max(0, min(1, frazione)))
         if allinea_destra:
-            barra = pygame.Rect(cornice.right - riempita, y, riempita, altezza)
+            barra = pygame.Rect(cornice.right - riempita, y, riempita, alt)
         else:
-            barra = pygame.Rect(x, y, riempita, altezza)
+            barra = pygame.Rect(cornice.left, y, riempita, alt)
         pygame.draw.rect(self.schermo, colore, barra)
         pygame.draw.rect(self.schermo, S.BIANCO, cornice, 2)
+        return cornice
 
+    def disegna_hud_lottatore(self, lott, bordo_x, allinea_destra):
+        larg = 360
+        vita_frac = lott.vita / S.VITA_MAX
+        col_vita = S.VERDE if vita_frac > 0.3 else S.ROSSO
+        cornice = self.disegna_barra(bordo_x, 24, larg, 26, vita_frac,
+                                     col_vita, allinea_destra)
+        # stamina (piu' sottile, sotto la vita)
+        self.disegna_barra(bordo_x, 54, larg, 10,
+                           lott.stamina / S.STAMINA_MAX, S.AZZURRO, allinea_destra)
         # nome
-        testo = self.font_piccolo.render(lottatore.nome, True, S.BIANCO)
-        tx = cornice.right - testo.get_width() if allinea_destra else x
-        self.schermo.blit(testo, (tx, y + altezza + 4))
-
-        # indicatori round vinti
+        testo = self.font_piccolo.render(lott.nome, True, S.BIANCO)
+        tx = cornice.right - testo.get_width() if allinea_destra else cornice.left
+        self.schermo.blit(testo, (tx, 70))
+        # pallini round
         for i in range(S.ROUND_PER_VINCERE):
-            cx = (cornice.right - 12 - i * 24) if allinea_destra else (x + 12 + i * 24)
-            colore_pallino = S.GIALLO if i < lottatore.round_vinti else S.GRIGIO
-            pygame.draw.circle(self.schermo, colore_pallino, (cx, y + altezza + 34), 8)
+            cx = (cornice.right - 12 - i * 24) if allinea_destra else (cornice.left + 12 + i * 24)
+            col = S.GIALLO if i < lott.round_vinti else S.GRIGIO
+            pygame.draw.circle(self.schermo, col, (cx, 100), 8)
 
     def disegna_hud(self):
-        self.disegna_barra_vita(self.p1, 30, allinea_destra=False)
-        self.disegna_barra_vita(self.p2, S.LARGHEZZA - 30, allinea_destra=True)
-
-        # timer al centro
+        self.disegna_hud_lottatore(self.p1, 30, False)
+        self.disegna_hud_lottatore(self.p2, S.LARGHEZZA - 30, True)
         secondi = max(0, int(self.tempo_round))
         testo = self.font_grande.render(str(secondi), True, S.BIANCO)
-        self.schermo.blit(testo, (S.LARGHEZZA // 2 - testo.get_width() // 2, 16))
+        self.schermo.blit(testo, (S.LARGHEZZA // 2 - testo.get_width() // 2, 18))
 
     def testo_centrato(self, testo, font, y, colore=S.BIANCO):
         sup = font.render(testo, True, colore)
         self.schermo.blit(sup, (S.LARGHEZZA // 2 - sup.get_width() // 2, y))
 
     def disegna_menu(self):
-        self.schermo.fill(S.CIELO)
-        self.testo_centrato("PICCHIADURO K1", self.font_grande, 120, S.GIALLO)
-        self.testo_centrato("Premi INVIO per iniziare", self.font, 260)
-        self.testo_centrato("ESC per uscire", self.font_piccolo, 300, S.GRIGIO)
+        self.disegna_ring()
+        self.testo_centrato("KICKBOXING K1", self.font_grande, 70, S.GIALLO)
+        self.testo_centrato("2.5D", self.font, 140, S.AZZURRO)
+
+        # selettore modalita'
+        opzioni = [("1 GIOCATORE (vs CPU)", self.vs_cpu),
+                   ("2 GIOCATORI", not self.vs_cpu)]
+        for i, (testo, sel) in enumerate(opzioni):
+            col = S.GIALLO if sel else S.GRIGIO
+            prefix = "> " if sel else "  "
+            self.testo_centrato(prefix + testo, self.font, 200 + i * 40, col)
+        self.testo_centrato("FRECCE per scegliere  -  INVIO per iniziare  -  ESC esci",
+                            self.font_piccolo, 300, S.BIANCO)
 
         comandi = [
-            "Giocatore 1:  A/D muovi  -  W salta  -  S accovaccia  -  F pugno  G calcio  H parata",
-            "Giocatore 2:  </> muovi  -  UP salta  -  DOWN accovaccia  -  Num1 pugno  Num2 calcio  Num3 parata",
+            "P1:  A/D lati  -  W/S profondita'  -  F jab  G diretto  V calcio basso  B calcio alto  Shift guardia",
+            "P2:  Frecce lati/profondita'  -  Num1 jab  Num2 diretto  Num3 calcio basso  Num5 calcio alto  Num0 guardia",
         ]
         for i, riga in enumerate(comandi):
-            self.testo_centrato(riga, self.font_piccolo, 400 + i * 34, S.BIANCO)
+            self.testo_centrato(riga, self.font_piccolo, 380 + i * 32, S.BIANCO)
 
     def disegna(self):
         if self.stato == MENU:
@@ -227,7 +258,7 @@ class Gioco:
                 self.testo_centrato(f"{vincitore.nome} VINCE!",
                                     self.font_grande, S.ALTEZZA // 2 - 60, S.GIALLO)
                 self.testo_centrato("Premi INVIO per tornare al menu",
-                                    self.font, S.ALTEZZA // 2 + 30)
+                                    self.font, S.ALTEZZA // 2 + 20)
         pygame.display.flip()
 
     # --------------------------------------------------------------- loop

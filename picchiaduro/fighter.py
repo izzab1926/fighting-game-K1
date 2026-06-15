@@ -1,195 +1,225 @@
-"""Il combattente: stato, fisica, attacchi e disegno."""
+"""Il kickboxer: stato, footwork 2.5D, colpi, stamina e disegno."""
 
 import pygame
 
 from . import settings as S
+from . import prospettiva as P
 
 
 class Lottatore:
-    """Un personaggio controllato da un giocatore."""
+    """Un kickboxer controllato da un giocatore o dalla CPU."""
 
-    def __init__(self, x, nome, colore, controlli, guarda_destra=True):
+    def __init__(self, x, z, nome, colore, controlli=None, guarda_destra=True):
         self.nome = nome
         self.colore = colore
-        self.controlli = controlli
+        self.controlli = controlli or {}
 
         self.larghezza = S.LARGHEZZA_LOTTATORE
         self.altezza = S.ALTEZZA_LOTTATORE
+
+        # posizione nel mondo: x lungo il ring, z profondita' (centro corpo)
         self.x = float(x)
-        self.y = float(S.SUOLO - self.altezza)
+        self.z = float(z)
         self.vx = 0.0
-        self.vy = 0.0
+        self.vz = 0.0
 
         self.guarda_destra = guarda_destra
         self.vita = S.VITA_MAX
+        self.stamina = S.STAMINA_MAX
         self.round_vinti = 0
 
-        self.a_terra = True
-        self.accovacciato = False
         self.sta_parando = False
 
-        # gestione attacchi
-        self.attacco = None          # nome dell'attacco in corso
+        # gestione colpi
+        self.attacco = None
         self.frame_attacco = 0
-        self.colpo_a_segno = False   # il colpo corrente ha già colpito?
+        self.colpo_a_segno = False
 
-        self.hitstun = 0             # frame in cui non può agire
+        self.hitstun = 0
         self.ko = False
 
-    # ------------------------------------------------------------------ geom
-    @property
-    def altezza_corrente(self):
-        if self.accovacciato and self.a_terra:
-            return S.ALTEZZA_ACCOVACCIATO
-        return self.altezza
-
-    @property
-    def rect(self):
-        h = self.altezza_corrente
-        return pygame.Rect(int(self.x), int(S.SUOLO - h), self.larghezza, h)
-
-    @property
-    def centro_x(self):
-        return self.x + self.larghezza / 2
-
     # ---------------------------------------------------------------- stato
+    @property
+    def meta_larghezza(self):
+        return self.larghezza / 2
+
     def puo_agire(self):
         return not self.ko and self.hitstun <= 0 and self.attacco is None
 
     def inizia_attacco(self, nome):
-        if not self.puo_agire() or self.accovacciato:
-            return
+        if not self.puo_agire():
+            return False
+        costo = S.ATTACCHI[nome]["stamina"]
+        if self.stamina < S.STAMINA_MIN_COLPO:
+            return False
         self.attacco = nome
         self.frame_attacco = 0
         self.colpo_a_segno = False
-        self.vx = 0
+        self.vx = self.vz = 0
+        self.stamina = max(0, self.stamina - costo)
+        return True
 
-    def hitbox_attacco(self):
-        """Rect attivo dell'attacco corrente, o None."""
+    def attacco_attivo(self):
+        """Vero se la hitbox del colpo corrente e' nella finestra attiva."""
         if self.attacco is None:
-            return None
-        dati = S.ATTACCHI[self.attacco]
-        ini, fine = dati["attivo"]
-        if not (ini <= self.frame_attacco <= fine):
-            return None
-        cima = S.SUOLO - self.altezza_corrente
-        y = cima + dati["offset_y"]
-        portata = dati["portata"]
-        if self.guarda_destra:
-            x = self.x + self.larghezza
-        else:
-            x = self.x - portata
-        return pygame.Rect(int(x), int(y), portata, dati["altezza_hitbox"])
+            return False
+        ini, fine = S.ATTACCHI[self.attacco]["attivo"]
+        return ini <= self.frame_attacco <= fine
 
-    def subisci_colpo(self, danno, knockback, direzione):
+    def colpisce(self, avversario):
+        """Vero se il colpo attivo raggiunge l'avversario (in X e in Z)."""
+        if not self.attacco_attivo():
+            return False
+        if abs(self.z - avversario.z) > S.TOLLERANZA_PROFONDITA:
+            return False
+        dati = S.ATTACCHI[self.attacco]
+        segno = 1 if self.guarda_destra else -1
+        fronte = self.x + segno * self.meta_larghezza
+        estremo = fronte + segno * dati["portata"]
+        lo, hi = min(fronte, estremo), max(fronte, estremo)
+        return lo <= avversario.x <= hi
+
+    def subisci_colpo(self, dati, direzione):
         if self.ko:
             return
+        danno = dati["danno"]
+        kb = dati["knockback"]
         if self.sta_parando:
             danno *= S.DANNO_PARATA
-            knockback *= 0.4
+            kb *= S.KB_PARATA
         else:
-            self.hitstun = S.STORDIMENTO_COLPO
+            self.hitstun = dati["stordimento"]
             self.attacco = None
         self.vita = max(0, self.vita - danno)
-        self.vx = knockback * direzione
+        self.vx = kb * direzione
         if self.vita <= 0:
             self.ko = True
 
-    # ------------------------------------------------------------- aggiorna
+    # -------------------------------------------------------------- input
     def gestisci_input(self, tasti):
         if not self.puo_agire():
             return
         c = self.controlli
-        self.sta_parando = tasti[c["parata"]] and self.a_terra
-        self.accovacciato = tasti[c["accovaccia"]] and self.a_terra
+        self.sta_parando = tasti[c["guardia"]]
 
-        self.vx = 0
-        if not self.sta_parando and not self.accovacciato:
+        self.vx = self.vz = 0
+        if not self.sta_parando:
             if tasti[c["sinistra"]]:
-                self.vx = -S.VELOCITA_CAMMINO
+                self.vx = -S.VELOCITA_X
             if tasti[c["destra"]]:
-                self.vx = S.VELOCITA_CAMMINO
-            if tasti[c["salta"]] and self.a_terra:
-                self.vy = S.FORZA_SALTO
-                self.a_terra = False
+                self.vx = S.VELOCITA_X
+            if tasti[c["avanti"]]:        # verso la camera (Z-)
+                self.vz = -S.VELOCITA_Z
+            if tasti[c["indietro"]]:      # verso il fondo (Z+)
+                self.vz = S.VELOCITA_Z
 
-        if tasti[c["pugno"]]:
-            self.inizia_attacco("pugno")
-        elif tasti[c["calcio"]]:
-            self.inizia_attacco("calcio")
+        if tasti[c["jab"]]:
+            self.inizia_attacco("jab")
+        elif tasti[c["diretto"]]:
+            self.inizia_attacco("diretto")
+        elif tasti[c["calcio_basso"]]:
+            self.inizia_attacco("calcio_basso")
+        elif tasti[c["calcio_alto"]]:
+            self.inizia_attacco("calcio_alto")
 
+    # ----------------------------------------------------------- aggiorna
     def aggiorna(self, avversario):
         if self.hitstun > 0:
             self.hitstun -= 1
 
-        # avanzamento attacco
+        # recupero fiato (piu' lento mentre si para)
+        rigen = S.STAMINA_RIGEN * (0.5 if self.sta_parando else 1.0)
+        self.stamina = min(S.STAMINA_MAX, self.stamina + rigen)
+
+        # avanzamento colpo
         if self.attacco is not None:
             self.frame_attacco += 1
             if self.frame_attacco > S.ATTACCHI[self.attacco]["durata"]:
                 self.attacco = None
 
-        # fisica
-        self.vy += S.GRAVITA
+        # movimento nel piano del ring
         self.x += self.vx
-        self.y += self.vy
+        self.z += self.vz
+        self.x = max(self.meta_larghezza,
+                     min(S.RING_LARGHEZZA - self.meta_larghezza, self.x))
+        self.z = max(0, min(S.RING_PROFONDITA, self.z))
 
-        if self.y >= S.SUOLO - self.altezza:
-            self.y = S.SUOLO - self.altezza
-            self.vy = 0
-            self.a_terra = True
-
-        # limiti arena
-        self.x = max(0, min(S.LARGHEZZA - self.larghezza, self.x))
-
-        # orientamento verso l'avversario (solo se libero di muoversi)
+        # orientamento verso l'avversario
         if avversario is not None and self.puo_agire():
-            self.guarda_destra = avversario.centro_x >= self.centro_x
+            self.guarda_destra = avversario.x >= self.x
 
-        self.vx *= 0.6  # attrito leggero sul knockback
+        self.vx *= 0.55  # smorza il knockback
 
-    # ---------------------------------------------------------------- reset
-    def reset_round(self, x, guarda_destra):
+    # ------------------------------------------------------------- reset
+    def reset_round(self, x, z, guarda_destra):
         self.x = float(x)
-        self.y = float(S.SUOLO - self.altezza)
-        self.vx = self.vy = 0
+        self.z = float(z)
+        self.vx = self.vz = 0
         self.vita = S.VITA_MAX
+        self.stamina = S.STAMINA_MAX
         self.guarda_destra = guarda_destra
-        self.a_terra = True
-        self.accovacciato = False
         self.sta_parando = False
         self.attacco = None
+        self.frame_attacco = 0
+        self.colpo_a_segno = False
         self.hitstun = 0
         self.ko = False
 
-    # --------------------------------------------------------------- disegno
+    # ----------------------------------------------------------- disegno
     def disegna(self, surf):
-        r = self.rect
+        s = P.scala(self.z)
+        piede_x, piede_y = P.proietta(self.x, self.z)
+        larg = self.larghezza * s
+        alt = self.altezza * s
 
-        # corpo
-        colore = self.colore
-        if self.hitstun > 0:
-            colore = S.BIANCO
-        pygame.draw.rect(surf, colore, r, border_radius=6)
-        pygame.draw.rect(surf, S.NERO, r, width=2, border_radius=6)
+        # ombra a terra (indizio di profondita')
+        ombra = pygame.Surface((int(larg * 1.3), int(larg * 0.45)), pygame.SRCALPHA)
+        pygame.draw.ellipse(ombra, (*S.OMBRA, 110), ombra.get_rect())
+        surf.blit(ombra, (piede_x - larg * 0.65, piede_y - larg * 0.22))
+
+        corpo = pygame.Rect(0, 0, int(larg), int(alt))
+        corpo.midbottom = (int(piede_x), int(piede_y))
+
+        colore = S.BIANCO if self.hitstun > 0 else self.colore
+        pygame.draw.rect(surf, colore, corpo, border_radius=int(6 * s) + 1)
+        pygame.draw.rect(surf, S.NERO, corpo, width=2, border_radius=int(6 * s) + 1)
 
         # testa
-        raggio = 22
-        cx = int(self.centro_x)
-        cy = r.top - raggio + 6
+        raggio = int(22 * s)
+        cx = corpo.centerx
+        cy = corpo.top - raggio + int(6 * s)
         pygame.draw.circle(surf, colore, (cx, cy), raggio)
         pygame.draw.circle(surf, S.NERO, (cx, cy), raggio, 2)
-
-        # occhio nella direzione di sguardo
         dx = raggio // 2 if self.guarda_destra else -raggio // 2
-        pygame.draw.circle(surf, S.NERO, (cx + dx, cy - 4), 4)
+        pygame.draw.circle(surf, S.NERO, (cx + dx, cy - int(4 * s)), max(2, int(4 * s)))
 
-        # scudo di parata
+        # guantoni in guardia
         if self.sta_parando:
-            scudo = r.inflate(18, 18)
-            pygame.draw.rect(surf, S.GIALLO, scudo, width=3, border_radius=10)
+            gy = corpo.top + int(alt * 0.28)
+            for off in (-int(larg * 0.30), int(larg * 0.30)):
+                pygame.draw.circle(surf, S.ROSSO, (cx + off, gy), int(11 * s))
+            scudo = corpo.inflate(int(16 * s), int(16 * s))
+            pygame.draw.rect(surf, S.GIALLO, scudo, width=2,
+                             border_radius=int(10 * s))
 
-        # braccio/gamba d'attacco
-        hb = self.hitbox_attacco()
-        if hb is not None:
-            col = S.ARANCIO if self.attacco == "pugno" else S.ROSSO
-            pygame.draw.rect(surf, col, hb, border_radius=4)
+        # arto che colpisce
+        if self.attacco is not None:
+            self._disegna_colpo(surf, corpo, s)
+
+    def _disegna_colpo(self, surf, corpo, s):
+        dati = S.ATTACCHI[self.attacco]
+        attivo = self.attacco_attivo()
+        segno = 1 if self.guarda_destra else -1
+        y = corpo.top + int(corpo.height * dati["offset_y"])
+        lung = int(dati["portata"] * s * (1.0 if attivo else 0.55))
+        spess = int(dati["altezza"] * s)
+        x = corpo.right if self.guarda_destra else corpo.left - lung
+        rect = pygame.Rect(x, y, lung, spess)
+        if "calcio" in self.attacco:
+            col = S.ROSSO if attivo else S.ARANCIO
+        else:
+            col = S.ARANCIO if attivo else S.GIALLO
+        pygame.draw.rect(surf, col, rect, border_radius=int(4 * s))
+        # guantone/piede in punta
+        punta = (rect.right, rect.centery) if self.guarda_destra else (rect.left, rect.centery)
+        pygame.draw.circle(surf, col, punta, max(3, int(10 * s)))
